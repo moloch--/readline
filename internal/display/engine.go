@@ -25,6 +25,7 @@ type Engine struct {
 	highlighter    func(line []rune) string
 	startCols      int
 	startRows      int
+	promptCols     int
 	lineCol        int
 	lineRows       int
 	cursorRow      int
@@ -32,6 +33,7 @@ type Engine struct {
 	hintRows       int
 	compRows       int
 	primaryPrinted bool
+	startKnown     bool
 
 	// UI components
 	keys      *core.Keys
@@ -44,6 +46,7 @@ type Engine struct {
 	hint      *ui.Hint
 	completer *completion.Engine
 	opts      *inputrc.Config
+	cursorPos func() (int, int)
 }
 
 // NewEngine is a required constructor for the display engine.
@@ -56,6 +59,7 @@ func NewEngine(k *core.Keys, s *core.Selection, h *history.Sources, p *ui.Prompt
 		hint:      i,
 		completer: c,
 		opts:      opts,
+		cursorPos: k.GetCursorPos,
 	}
 }
 
@@ -64,6 +68,7 @@ func NewEngine(k *core.Keys, s *core.Selection, h *history.Sources, p *ui.Prompt
 // have bound it after instantiating a new shell instance.
 func Init(e *Engine, highlighter func([]rune) string) {
 	e.highlighter = highlighter
+	e.startKnown = false
 }
 
 // Refresh recomputes and redisplays the entire readline interface, except
@@ -108,6 +113,7 @@ func (e *Engine) Refresh() {
 func (e *Engine) PrintPrimaryPrompt() {
 	e.prompt.PrimaryPrint()
 	e.primaryPrinted = true
+	e.startKnown = false
 }
 
 // ClearHelpers clears the hint and completion sections below the line.
@@ -211,16 +217,25 @@ func (e *Engine) computeCoordinates(suggested bool) {
 		e.suggested = e.histories.Suggest(e.line)
 	}
 
-	// Get the position of the line's beginning by querying
-	// the terminal for the cursor position.
-	e.startCols, e.startRows = e.keys.GetCursorPos()
+	// Determine the position of the line's beginning. Querying the terminal
+	// cursor position (CSI 6n) is expensive over slow/remote links, so cache
+	// the result for the duration of a prompt cycle and only re-query when
+	// explicitly invalidated (eg. on resize or prompt reprint).
+	if !e.startKnown {
+		e.startCols, e.startRows = e.cursorPos()
 
-	if e.startCols > 0 {
-		e.startCols--
-	}
+		if e.startCols > 0 {
+			e.startCols--
+		}
 
-	// Cursor position might be misleading if invalid (negative).
-	if e.startCols == -1 {
+		// Cursor position might be misleading if invalid (negative).
+		if e.startCols == -1 {
+			e.startCols = e.prompt.LastUsed()
+		}
+
+		e.startKnown = e.startCols >= 0 && e.startRows >= 0
+	} else {
+		// Even when cached, keep startCols in sync with the prompt width.
 		e.startCols = e.prompt.LastUsed()
 	}
 
@@ -360,4 +375,10 @@ func (e *Engine) AvailableHelperLines() int {
 	}
 
 	return compLines
+}
+
+// invalidateStart forces the next refresh to re-query the terminal for
+// cursor position, used when layout assumptions may have changed (resize).
+func (e *Engine) invalidateStart() {
+	e.startKnown = false
 }

@@ -17,7 +17,6 @@ func WatchResize(eng *Engine) chan<- bool {
 		for {
 			select {
 			case <-resizeChannel:
-				eng.invalidateStart()
 				// Weird behavior on Windows: when there is no autosuggested line,
 				// the cursor moves at the end of the completions area, if non-empty.
 				// We must manually go back to the input cursor position first.

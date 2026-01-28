@@ -1,7 +1,7 @@
 package display
 
 import (
-	"fmt"
+	"regexp"
 
 	"github.com/reeflective/readline/inputrc"
 	"github.com/reeflective/readline/internal/color"
@@ -25,7 +25,6 @@ type Engine struct {
 	highlighter    func(line []rune) string
 	startCols      int
 	startRows      int
-	promptCols     int
 	lineCol        int
 	lineRows       int
 	cursorRow      int
@@ -33,7 +32,10 @@ type Engine struct {
 	hintRows       int
 	compRows       int
 	primaryPrinted bool
-	startKnown     bool
+	cursorKnown    bool
+	cursorDirty    bool
+	commentBegin   string
+	commentRegexp  *regexp.Regexp
 
 	// UI components
 	keys      *core.Keys
@@ -46,7 +48,6 @@ type Engine struct {
 	hint      *ui.Hint
 	completer *completion.Engine
 	opts      *inputrc.Config
-	cursorPos func() (int, int)
 }
 
 // NewEngine is a required constructor for the display engine.
@@ -59,7 +60,6 @@ func NewEngine(k *core.Keys, s *core.Selection, h *history.Sources, p *ui.Prompt
 		hint:      i,
 		completer: c,
 		opts:      opts,
-		cursorPos: k.GetCursorPos,
 	}
 }
 
@@ -68,13 +68,15 @@ func NewEngine(k *core.Keys, s *core.Selection, h *history.Sources, p *ui.Prompt
 // have bound it after instantiating a new shell instance.
 func Init(e *Engine, highlighter func([]rune) string) {
 	e.highlighter = highlighter
-	e.startKnown = false
 }
 
 // Refresh recomputes and redisplays the entire readline interface, except
 // the first lines of the primary prompt when the latter is a multiline one.
 func (e *Engine) Refresh() {
-	fmt.Print(term.HideCursor)
+	term.BeginBuffer()
+	defer term.EndBuffer()
+
+	term.WriteString(term.HideCursor)
 
 	// Go back to the first column, and if the primary prompt
 	// was not printed yet, back up to the line's beginning row.
@@ -86,6 +88,12 @@ func (e *Engine) Refresh() {
 
 	// Print either all or the last line of the prompt.
 	e.prompt.LastPrint()
+
+	// Flush prompt output before querying the cursor position.
+	if term.ShouldQueryCursorPos() {
+		term.EndBuffer()
+		term.BeginBuffer()
+	}
 
 	// Get all positions required for the redisplay to come:
 	// prompt end (thus indentation), cursor positions, etc.
@@ -104,7 +112,7 @@ func (e *Engine) Refresh() {
 	} else {
 		e.lineEndToCursorPos()
 	}
-	fmt.Print(term.ShowCursor)
+	term.WriteString(term.ShowCursor)
 }
 
 // PrintPrimaryPrompt redraws the primary prompt.
@@ -113,13 +121,13 @@ func (e *Engine) Refresh() {
 func (e *Engine) PrintPrimaryPrompt() {
 	e.prompt.PrimaryPrint()
 	e.primaryPrinted = true
-	e.startKnown = false
+	e.MarkCursorDirty()
 }
 
 // ClearHelpers clears the hint and completion sections below the line.
 func (e *Engine) ClearHelpers() {
 	e.CursorBelowLine()
-	fmt.Print(term.ClearScreenBelow)
+	term.WriteString(term.ClearScreenBelow)
 
 	term.MoveCursorUp(1)
 	term.MoveCursorUp(e.lineRows)
@@ -146,14 +154,15 @@ func (e *Engine) AcceptLine() {
 	term.MoveCursorBackwards(term.GetWidth())
 	term.MoveCursorDown(e.lineRows)
 	term.MoveCursorForwards(e.lineCol)
-	fmt.Print(term.ClearScreenBelow)
+	term.WriteString(term.ClearScreenBelow)
 
 	// Reprint the right-side prompt if it's not a tooltip one.
 	e.prompt.RightPrint(e.lineCol, false)
 
 	// Go below this non-suggested line and clear everything.
 	term.MoveCursorBackwards(term.GetWidth())
-	fmt.Print(term.NewlineReturn)
+	term.WriteString(term.NewlineReturn)
+	e.MarkCursorDirty()
 }
 
 // RefreshTransient goes back to the first line of the input buffer
@@ -170,7 +179,8 @@ func (e *Engine) RefreshTransient() {
 	// And redisplay the transient/primary/line.
 	e.prompt.TransientPrint()
 	e.displayLine()
-	fmt.Print(term.NewlineReturn)
+	term.WriteString(term.NewlineReturn)
+	e.MarkCursorDirty()
 }
 
 // CursorToLineStart moves the cursor just after the primary prompt.
@@ -189,7 +199,7 @@ func (e *Engine) CursorToLineStart() {
 func (e *Engine) CursorBelowLine() {
 	term.MoveCursorUp(e.cursorRow)
 	term.MoveCursorDown(e.lineRows)
-	fmt.Print(term.NewlineReturn)
+	term.WriteString(term.NewlineReturn)
 }
 
 // lineStartToCursorPos can be used if the cursor is currently
@@ -208,6 +218,11 @@ func (e *Engine) cursorHintToLineStart() {
 	e.CursorToLineStart()
 }
 
+// MarkCursorDirty forces the next refresh to query the cursor position.
+func (e *Engine) MarkCursorDirty() {
+	e.cursorDirty = true
+}
+
 func (e *Engine) computeCoordinates(suggested bool) {
 	// Get the new input line and auto-suggested one.
 	e.line, e.cursor = e.completer.Line()
@@ -217,12 +232,10 @@ func (e *Engine) computeCoordinates(suggested bool) {
 		e.suggested = e.histories.Suggest(e.line)
 	}
 
-	// Determine the position of the line's beginning. Querying the terminal
-	// cursor position (CSI 6n) is expensive over slow/remote links, so cache
-	// the result for the duration of a prompt cycle and only re-query when
-	// explicitly invalidated (eg. on resize or prompt reprint).
-	if !e.startKnown {
-		e.startCols, e.startRows = e.cursorPos()
+	// Get the position of the line's beginning. When possible, reuse the
+	// cached cursor row to avoid the expensive terminal query.
+	if term.ShouldQueryCursorPos() && (!e.cursorKnown || e.cursorDirty) {
+		e.startCols, e.startRows = e.keys.GetCursorPos()
 
 		if e.startCols > 0 {
 			e.startCols--
@@ -233,10 +246,17 @@ func (e *Engine) computeCoordinates(suggested bool) {
 			e.startCols = e.prompt.LastUsed()
 		}
 
-		e.startKnown = e.startCols >= 0 && e.startRows >= 0
+		e.cursorKnown = true
+		e.cursorDirty = false
 	} else {
-		// Even when cached, keep startCols in sync with the prompt width.
-		e.startCols = e.prompt.LastUsed()
+		e.startCols = e.prompt.LastCols()
+		if e.startCols == 0 {
+			e.startCols = e.prompt.LastUsed()
+		}
+		if !e.cursorKnown {
+			e.startRows = 0
+			e.cursorKnown = true
+		}
 	}
 
 	e.cursorCol, e.cursorRow = core.CoordinatesCursor(e.cursor, e.startCols)
@@ -284,8 +304,8 @@ func (e *Engine) displayLine() {
 
 	// Adjust the cursor if the line fits exactly in the terminal width.
 	if e.lineCol == 0 {
-		fmt.Print(term.NewlineReturn)
-		fmt.Print(term.ClearLineAfter)
+		term.WriteString(term.NewlineReturn)
+		term.WriteString(term.ClearLineAfter)
 	}
 }
 
@@ -325,7 +345,7 @@ func (e *Engine) displayHelpers() bool {
 		return false
 	}
 
-	fmt.Print(term.NewlineReturn)
+	term.WriteString(term.NewlineReturn)
 
 	prevHintRows := e.hintRows
 	prevCompRows := e.compRows
@@ -342,7 +362,7 @@ func (e *Engine) displayHelpers() bool {
 	}
 
 	if e.hintRows+e.compRows < prevHintRows+prevCompRows {
-		fmt.Print(term.ClearScreenBelow)
+		term.WriteString(term.ClearScreenBelow)
 	}
 
 	// Go back to the first line below the input line.
@@ -375,10 +395,4 @@ func (e *Engine) AvailableHelperLines() int {
 	}
 
 	return compLines
-}
-
-// invalidateStart forces the next refresh to re-query the terminal for
-// cursor position, used when layout assumptions may have changed (resize).
-func (e *Engine) invalidateStart() {
-	e.startKnown = false
 }

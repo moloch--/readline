@@ -1,19 +1,19 @@
 package readline
 
 import (
-	"bytes"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
-	"unicode/utf8"
 
 	"github.com/rivo/uniseg"
 
 	"github.com/reeflective/readline/inputrc"
 	"github.com/reeflective/readline/internal/color"
 	"github.com/reeflective/readline/internal/completion"
+	"github.com/reeflective/readline/internal/core"
 	"github.com/reeflective/readline/internal/keymap"
 	"github.com/reeflective/readline/internal/strutil"
 	"github.com/reeflective/readline/internal/term"
@@ -60,6 +60,7 @@ func (rl *Shell) standardCommands() commands {
 		"tab-insert":                   rl.tabInsert,
 		"self-insert":                  rl.selfInsert,
 		"bracketed-paste-begin":        rl.bracketedPasteBegin,
+		"skip-csi-sequence":            rl.skipCsiSequence,
 		"transpose-chars":              rl.transposeChars,
 		"transpose-words":              rl.transposeWords,
 		"shell-transpose-words":        rl.shellTransposeWords,
@@ -167,6 +168,12 @@ func (rl *Shell) forwardChar() {
 	// Only exception where we actually don't forward a character.
 	if rl.Config.GetBool("history-autosuggest") && rl.cursor.Pos() >= rl.line.Len()-1 {
 		rl.autosuggestAccept()
+	}
+
+	// Fall back to an application-provided inline suggestion when history
+	// autosuggest accepted nothing and the cursor is at the end of the line.
+	if rl.cursor.Pos() == startPos {
+		rl.acceptInlineSuggestion()
 	}
 
 	if rl.cursor.Pos() > startPos {
@@ -450,82 +457,105 @@ func (rl *Shell) selfInsert() {
 }
 
 func (rl *Shell) bracketedPasteBegin() {
-	rl.History.SkipSave()
-	rl.completer.TrimSuffix()
+	if rl.History != nil {
+		rl.History.SkipSave()
+	}
+	if rl.completer != nil {
+		rl.completer.TrimSuffix()
+	}
 
-	const endSeq = "\x1b[201~"
-
-	data := rl.Keys.DrainBuffer()
+	// Length of bracketed paste escape code; this is the minimum length
+	// we will see here.
+	sequence := make([]byte, 0, 6)
 
 	for {
-		if idx := bytes.Index(data, []byte(endSeq)); idx >= 0 {
-			payload := data[:idx]
-			rest := data[idx+len(endSeq):]
-			if len(rest) > 0 {
-				rl.Keys.PrependBuffer(rest)
+		// Raw input is byte-oriented; macro input stores Unicode runes. Consume
+		// raw bytes without merging a terminator with following combining marks,
+		// while retaining complete Unicode characters when replaying macros.
+		var key []byte
+		var empty bool
+		if rl.Keys.BufferSize() > 0 {
+			var b byte
+			b, empty = core.PopKey(rl.Keys)
+			key = []byte{b}
+		} else {
+			key, empty = core.PopChar(rl.Keys)
+		}
+		if empty {
+			core.WaitAvailableKeys(rl.Keys, rl.Config)
+			// Stop consuming the paste if the input stream died or errored,
+			// otherwise this loop spins forever on a dead tty.
+			if rl.Keys.IsEOF() || rl.Keys.ReadError() != nil {
+				rl.insertPastedText(string(sequence))
+				rl.Keys.SetMatched([]rune("\x1b[200~" + string(sequence) + "\x1b[201~")...)
+				return
 			}
 
-			rl.insertPastedBytes(payload)
-			return
-		}
-
-		more, err := rl.Keys.ReadInput()
-		if err != nil {
-			rl.insertPastedBytes(data)
-			return
-		}
-
-		if len(more) == 0 {
 			continue
 		}
 
-		data = append(data, more...)
+		sequence = append(sequence, key...)
+
+		if len(sequence) >= 6 && slices.Equal(sequence[len(sequence)-6:], []byte{'\x1b', '[', '2', '0', '1', '~'}) {
+			break
+		}
+	}
+
+	// Record the complete framed paste so a macro replays it as one insertion,
+	// including Unicode and newlines, without waiting for a missing terminator.
+	rl.Keys.SetMatched([]rune("\x1b[200~" + string(sequence))...)
+
+	if len(sequence) > 6 {
+		rl.insertPastedText(string(sequence[:len(sequence)-6]))
 	}
 }
 
-func (rl *Shell) insertPastedBytes(data []byte) {
-	if len(data) == 0 {
+func (rl *Shell) insertPastedText(text string) {
+	// Terminals send \r (or \r\n) for line breaks inside a bracketed paste.
+	// Normalise them to \n, otherwise the stray carriage returns corrupt the
+	// line buffer and break multiline display and evaluation.
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+
+	if rl.PasteTransformer != nil {
+		text = rl.PasteTransformer(text)
+	}
+	if text == "" {
 		return
 	}
 
-	runes := normalizePasteBytes(data)
-	if len(runes) == 0 {
-		return
-	}
-
-	rl.cursor.InsertAt(runes...)
-	rl.Keys.SetMatched(runes...)
+	rl.cursor.InsertAt([]rune(text)...)
 }
 
-func normalizePasteBytes(data []byte) []rune {
-	if len(data) == 0 {
-		return nil
-	}
+// skipCsiSequence consumes the remainder of a CSI escape sequence (the GNU
+// readline skip-csi-sequence command). Terminals encode many special keys as
+// "ESC [" followed by parameter/intermediate bytes (0x20-0x3F) and a single
+// final byte (0x40-0x7E) -- e.g. F5 is "\e[15~", Shift-Tab is "\e[Z". When such
+// a key has no binding, its trailing bytes would otherwise be self-inserted as
+// stray characters. Bound to "\e[", this command catches any CSI sequence that
+// no longer/exact binding claimed and swallows the rest of it, so unrecognised
+// keys do nothing.
+//
+// It is intentionally left unbound by default (as in GNU readline); enable it
+// from inputrc by binding the sequence "\e[" to the skip-csi-sequence command.
+func (rl *Shell) skipCsiSequence() {
+	rl.History.SkipSave()
 
-	out := make([]rune, 0, len(data))
-
-	for len(data) > 0 {
-		if data[0] == '\r' {
-			if len(data) > 1 && data[1] == '\n' {
-				data = data[1:]
-			}
-			out = append(out, '\n')
-			data = data[1:]
-			continue
+	// Whatever the dispatcher already consumed of the sequence, drain the rest:
+	// keep popping parameter/intermediate bytes, and stop once we consume the
+	// terminating byte (the final byte, or any non-CSI byte). The keys of a CSI
+	// sequence arrive in a single terminal read, so they are already buffered;
+	// if the buffer empties we simply stop rather than block on a partial one.
+	for {
+		key, empty := core.PopKey(rl.Keys)
+		if empty {
+			return
 		}
 
-		r, size := utf8.DecodeRune(data)
-		if r == utf8.RuneError && size == 1 {
-			out = append(out, rune(data[0]))
-			data = data[1:]
-			continue
+		if key < 0x20 || key >= 0x40 {
+			return
 		}
-
-		out = append(out, r)
-		data = data[size:]
 	}
-
-	return out
 }
 
 // Drag the character before point forward over the character
@@ -1532,7 +1562,7 @@ func (rl *Shell) dumpVariables() {
 	}()
 
 	// Get all variables and their values, alphabetically sorted.
-	var variables []string
+	variables := make([]string, 0, len(rl.Config.Vars))
 
 	for variable := range rl.Config.Vars {
 		variables = append(variables, variable)

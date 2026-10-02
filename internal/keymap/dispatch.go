@@ -1,6 +1,7 @@
 package keymap
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/reeflective/readline/inputrc"
@@ -179,19 +180,32 @@ func (m *Engine) matchBind(keys []byte, binds map[string]inputrc.Bind) (inputrc.
 	var match inputrc.Bind
 	var prefixed []inputrc.Bind
 
-	keysStr := string(keys)
+	// Make a sorted list with all keys in the binds map.
+	sequences := make([]string, 0, len(binds))
+	for sequence := range binds {
+		sequences = append(sequences, sequence)
+	}
 
-	// Iterate over the list of sequences and find all binds
-	// that match the sequence either by prefix or exactly.
-	for sequence, bind := range binds {
-		seq := strutil.ConvertMeta([]rune(sequence))
-
-		if len(keysStr) < len(seq) && strings.HasPrefix(seq, keysStr) {
-			prefixed = append(prefixed, bind)
+	// Sort the list of sequences by alphabetical order and length.
+	sort.Slice(sequences, func(i, j int) bool {
+		if len(sequences[i]) == len(sequences[j]) {
+			return sequences[i] < sequences[j]
 		}
 
-		if keysStr == seq {
-			match = bind
+		return len(sequences[i]) < len(sequences[j])
+	})
+
+	// Iterate over the sorted list of sequences and find all binds
+	// that match the sequence either by prefix or exactly.
+	for _, sequence := range sequences {
+		seq := strutil.ConvertMeta([]rune(sequence))
+
+		if len(string(keys)) < len(seq) && strings.HasPrefix(seq, string(keys)) {
+			prefixed = append(prefixed, binds[sequence])
+		}
+
+		if string(keys) == seq {
+			match = binds[sequence]
 		}
 	}
 
@@ -254,6 +268,7 @@ func (m *Engine) handleEscape(main bool) (bind inputrc.Bind, cmd func(), pref bo
 func (m *Engine) makeMatch(active, prefixed inputrc.Bind) (prefix bool) {
 	m.active = active
 	m.prefixed = prefixed
+
 	return m.prefixed.Action != ""
 }
 

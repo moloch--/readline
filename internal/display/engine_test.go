@@ -12,6 +12,8 @@ import (
 
 func newTestEngine(t *testing.T) *Engine {
 	t.Helper()
+	t.Setenv("INPUTRC", "/dev/null")
+	t.Setenv("READLINE_CURSOR_POS", "1")
 
 	line := &core.Line{}
 	cursor := core.NewCursor(line)
@@ -33,13 +35,13 @@ func newTestEngine(t *testing.T) *Engine {
 	return eng
 }
 
-func TestComputeCoordinatesCachesCursorQuery(t *testing.T) {
+func TestComputeCoordinatesRefreshesTerminalRow(t *testing.T) {
 	eng := newTestEngine(t)
 
 	calls := 0
 	eng.cursorPos = func() (int, int) {
 		calls++
-		return 3, 5
+		return 3, 5 - calls
 	}
 
 	eng.computeCoordinates(false)
@@ -47,20 +49,20 @@ func TestComputeCoordinatesCachesCursorQuery(t *testing.T) {
 		t.Fatalf("expected cursorPos to be queried once, got %d", calls)
 	}
 
-	calls = 0
+	// A helper repaint may scroll the terminal between frames. Reusing the
+	// previous absolute row would incorrectly reserve space at the bottom.
 	eng.computeCoordinates(false)
-	if calls != 0 {
-		t.Fatalf("expected cached coordinates to be reused, got %d extra queries", calls)
+	if calls != 2 || eng.startRows != 3 {
+		t.Fatalf("expected refreshed terminal row 3, got row %d after %d queries", eng.startRows, calls)
 	}
 }
 
 func TestComputeCoordinatesTracksPromptWidthWithoutQuery(t *testing.T) {
 	eng := newTestEngine(t)
+	_ = eng.opts.Set("cursor-position-probe", false)
 
-	eng.cursorPos = func() (int, int) { return 2, 4 }
-	eng.computeCoordinates(false)
-
-	// Change the prompt width; the cached coordinates should update without re-querying.
+	// With no probe, derive columns from the prompt and leave the absolute
+	// terminal row unknown so the refresh reserves a trailing row safely.
 	promptCalls := 0
 	eng.cursorPos = func() (int, int) {
 		promptCalls++
@@ -76,6 +78,9 @@ func TestComputeCoordinatesTracksPromptWidthWithoutQuery(t *testing.T) {
 
 	if got, want := eng.startCols, eng.prompt.LastUsed(); got != want {
 		t.Fatalf("startCols mismatch after prompt change, got %d want %d", got, want)
+	}
+	if eng.startCols != 4 || eng.startRowKnown() {
+		t.Fatalf("fallback coordinates = (%d, %d), want (4, unknown)", eng.startCols, eng.startRows)
 	}
 }
 
@@ -93,9 +98,32 @@ func TestComputeCoordinatesInvalidationForcesQuery(t *testing.T) {
 		t.Fatalf("expected initial cursorPos query, got %d", calls)
 	}
 
-	eng.invalidateStart()
+	eng.MarkCursorDirty()
 	eng.computeCoordinates(false)
 	if calls != 2 {
 		t.Fatalf("expected cursorPos to be queried after invalidation, got %d", calls)
+	}
+}
+
+func TestComputeCoordinatesHonorsEnvironmentProbePolicy(t *testing.T) {
+	for _, env := range []struct {
+		name, value, program string
+	}{
+		{"disabled", "off", ""},
+		{"iTerm", "", "iTerm.app"},
+	} {
+		t.Run(env.name, func(t *testing.T) {
+			eng := newTestEngine(t)
+			t.Setenv("READLINE_CURSOR_POS", env.value)
+			t.Setenv("TERM_PROGRAM", env.program)
+			eng.cursorPos = func() (int, int) {
+				t.Fatal("unexpected terminal probe")
+				return 0, 0
+			}
+			eng.computeCoordinates(false)
+			if eng.startCols != 2 || eng.startRowKnown() {
+				t.Fatalf("fallback coordinates = (%d, %d), want (2, unknown)", eng.startCols, eng.startRows)
+			}
+		})
 	}
 }

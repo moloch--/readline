@@ -3,6 +3,7 @@ package inputrc
 import (
 	"bytes"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os/user"
@@ -166,11 +167,13 @@ func TestDecodeKey(t *testing.T) {
 func newConfig() (*Config, map[string][]string) {
 	cfg := NewDefaultConfig(WithConfigReadFileFunc(readTestdata))
 	keys := make(map[string][]string)
-	cfg.Funcs["$custom"] = func(k, v string) error {
+	// The error return is mandated by the Config.Funcs signature, so unparam's
+	// "always nil" is expected here.
+	cfg.Funcs["$custom"] = func(k, v string) error { //nolint:unparam
 		keys[k] = append(keys[k], v)
 		return nil
 	}
-	cfg.Funcs[""] = func(k, v string) error {
+	cfg.Funcs[""] = func(k, v string) error { //nolint:unparam
 		keys[k] = append(keys[k], v)
 		return nil
 	}
@@ -207,7 +210,7 @@ func buildOpts(t *testing.T, buf []byte) []Option {
 	lines := bytes.Split(bytes.TrimSpace(buf), []byte{'\n'})
 	var opts []Option
 
-	for i := 0; i < len(lines); i++ {
+	for i := range lines {
 		line := bytes.TrimSpace(lines[i])
 		// If the line is empty, keep going
 		if len(line) == 0 {
@@ -381,6 +384,8 @@ func parseBool(t *testing.T, buf []byte) bool {
 	return false
 }
 
+var errInvalidTestData = errors.New("test data is invalid")
+
 func readTestdata(name string) ([]byte, error) {
 	switch name {
 	case "/home/ken/.inputrc", "\\home\\ken\\_inputrc":
@@ -399,7 +404,7 @@ func readTestdata(name string) ([]byte, error) {
 
 	v := bytes.Split(buf, []byte(delimiter))
 	if len(v) != 3 {
-		return nil, fmt.Errorf("test data %s is invalid", name)
+		return nil, fmt.Errorf("%w: %s", errInvalidTestData, name)
 	}
 
 	return v[1], nil

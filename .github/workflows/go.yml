@@ -18,12 +18,12 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Set up Go
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v6
       with:
-        go-version: 1.22.6
+        go-version-file: go.mod
 
     - name: Build
       run: go build -v ./...
@@ -37,12 +37,12 @@ jobs:
     runs-on: windows-latest 
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Set up Go
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v6
       with:
-        go-version: 1.22.6
+        go-version-file: go.mod
 
     - name: Build
       run: go build -v ./...

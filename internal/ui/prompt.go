@@ -6,24 +6,26 @@ import (
 	"strings"
 
 	"github.com/reeflective/readline/inputrc"
+	"github.com/reeflective/readline/internal/color"
 	"github.com/reeflective/readline/internal/core"
 	"github.com/reeflective/readline/internal/keymap"
 	"github.com/reeflective/readline/internal/strutil"
 	"github.com/reeflective/readline/internal/term"
 )
 
-const (
-	secondaryPromptDefault = "\x1b[1;30m\U00002514 \x1b[0m"
-	multilineColumnDefault = "\x1b[1;30m\U00002502 \x1b[0m"
+var (
+	// DefaultSecondaryPrompt is the default prompt to use for secondary lines.
+	DefaultSecondaryPrompt = color.FgBlackBright + "\U00002514 " + color.Reset
+	// DefaultMultilineColumn is the default prompt to use for multiline columns.
+	DefaultMultilineColumn = color.FgBlackBright + "\U00002502 " + color.Reset
 )
 
 // Prompt stores all prompt rendering/generation functions and is
 // in charge of displaying them, as well as computing their offsets.
 type Prompt struct {
-	primaryF       func() string
-	primaryRows    int
-	primaryCols    int
-	primaryColsRaw int
+	primaryF    func() string
+	primaryRows int
+	primaryCols int
 
 	secondaryF func() string
 	transientF func() string
@@ -116,12 +118,7 @@ func (p *Prompt) PrimaryPrint() {
 
 	// And compute coordinates
 	p.primaryRows = strings.Count(prompt, "\n")
-	p.primaryColsRaw = strutil.RealLength(lastPrompt)
-	p.primaryCols = p.primaryColsRaw
-
-	if p.primaryCols > 0 {
-		p.primaryCols--
-	}
+	p.primaryCols = strutil.RealLength(lastPrompt)
 }
 
 // PrimaryUsed returns the number of terminal rows on which
@@ -129,6 +126,32 @@ func (p *Prompt) PrimaryPrint() {
 // if it contains newlines.
 func (p *Prompt) PrimaryUsed() int {
 	return p.primaryRows
+}
+
+// UpperPrint reprints every line of the primary prompt except the last one.
+// It is used to keep a multi-line prompt's upper lines correct after the view
+// has scrolled (e.g. when the prompt is rendered at the bottom of the window),
+// since those lines are not otherwise repainted on a refresh.
+//
+// The cursor must be positioned at the first prompt row, column 0. On return
+// the cursor is at column 0 of the last prompt line's row (the upper lines each
+// end with a newline).
+func (p *Prompt) UpperPrint() {
+	if p.primaryF == nil || p.primaryRows == 0 {
+		return
+	}
+
+	upper, _ := p.formatPrimaryLines(p.primaryF())
+	if upper == "" {
+		return
+	}
+
+	// Clear each upper line as we reprint it, so a shorter prompt evaluation
+	// does not leave stale characters behind.
+	lines := strings.Split(strings.TrimSuffix(upper, "\n"), "\n")
+	for _, line := range lines {
+		term.WriteString(line + term.ClearLineAfter + term.NewlineReturn)
+	}
 }
 
 // LastPrint prints the last line of the primary prompt, if the latter
@@ -153,11 +176,7 @@ func (p *Prompt) LastPrint() {
 
 	term.WriteString(prompt)
 
-	p.primaryColsRaw = strutil.RealLength(prompt)
-	p.primaryCols = p.primaryColsRaw
-	if p.primaryCols > 0 {
-		p.primaryCols--
-	}
+	p.primaryCols = strutil.RealLength(prompt)
 }
 
 // LastUsed returns the number of terminal columns used by the last
@@ -178,35 +197,14 @@ func (p *Prompt) LastUsed() int {
 	}
 
 	prompt := p.formatLastPrompt(lines[len(lines)-1])
-	p.primaryColsRaw = strutil.RealLength(prompt)
-	p.primaryCols = p.primaryColsRaw
-
-	if p.primaryCols > 0 {
-		p.primaryCols--
-	}
+	p.primaryCols = strutil.RealLength(prompt)
 
 	return p.primaryCols
 }
 
-// LastCols returns the number of terminal columns used by the last prompt line.
+// LastCols returns the exact width of the last prompt line.
 func (p *Prompt) LastCols() int {
-	if p.primaryF == nil {
-		return 0
-	}
-
-	if p.primaryColsRaw != 0 {
-		return p.primaryColsRaw
-	}
-
-	lines := strings.Split(p.primaryF(), "\n")
-	if len(lines) == 0 {
-		return 0
-	}
-
-	prompt := p.formatLastPrompt(lines[len(lines)-1])
-	p.primaryColsRaw = strutil.RealLength(prompt)
-
-	return p.primaryColsRaw
+	return p.LastUsed()
 }
 
 // SecondaryPrint prints the last cursor in secondary prompt mode,
@@ -217,7 +215,7 @@ func (p *Prompt) SecondaryPrint() {
 		return
 	}
 
-	term.WriteString(secondaryPromptDefault)
+	term.WriteString(DefaultSecondaryPrompt)
 }
 
 // MultilineColumnPrint prints the multiline editor column status indicator.
@@ -229,28 +227,26 @@ func (p *Prompt) MultilineColumnPrint() {
 
 	switch {
 	case numbered:
-		column := ""
+		var column strings.Builder
 		for pos := range p.line.Lines() {
-			column += fmt.Sprintf("\n\x1b[1;30m%d\x1b[0m", pos+2)
+			fmt.Fprintf(&column, "\n"+color.FgBlackBright+"%d"+color.Reset+" ", pos+2)
 		}
 
-		term.WriteString(column)
-
+		term.WriteString(column.String())
 	case len(custom) > 0:
-		column := ""
+		var column strings.Builder
 		for range p.line.Lines() {
-			column += fmt.Sprintf("\n%s\x1b[0m", custom)
+			fmt.Fprintf(&column, "\n%s\x1b[0m", custom)
 		}
 
-		term.WriteString(column)
-
+		term.WriteString(column.String())
 	case defaultCol:
-		column := ""
+		var column strings.Builder
 		for range p.line.Lines() {
-			column += "\n" + multilineColumnDefault
+			column.WriteString("\n" + DefaultMultilineColumn)
 		}
 
-		term.WriteString(column)
+		term.WriteString(column.String())
 	}
 }
 

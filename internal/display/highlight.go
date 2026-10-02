@@ -11,6 +11,10 @@ import (
 	"github.com/reeflective/readline/internal/core"
 )
 
+// ansiEscapeRegex matches SGR color escape sequences embedded in a line. It is
+// compiled once at package load: getHighlights runs on every display refresh.
+var ansiEscapeRegex = regexp.MustCompile(`\x1b\[[0-9;]+m`)
+
 // highlightLine applies visual/selection highlighting to a line.
 // The provided line might already have been highlighted by a user-provided
 // highlighter: this function accounts for any embedded color sequences.
@@ -19,41 +23,41 @@ func (e *Engine) highlightLine(line []rune, selection core.Selection) string {
 	sorted := sortHighlights(selection)
 	colors := e.getHighlights(line, sorted)
 
-	var highlighted strings.Builder
+	var highlighted string
 
 	// And apply highlighting before each rune.
+	var highlightedSb25 strings.Builder
+
 	for i, r := range line {
 		if highlight, found := colors[i]; found {
-			highlighted.WriteString(highlight)
+			highlightedSb25.WriteString(string(highlight))
 		}
 
-		highlighted.WriteRune(r)
+		highlightedSb25.WriteRune(r)
 	}
 
-	result := highlighted.String()
+	highlighted += highlightedSb25.String()
 
-	// Finally, highlight comments using a cached regex.
+	// Finally, highlight comments using a regex. The pattern only depends on
+	// the comment-begin option, so compile it lazily and reuse it until that
+	// option changes, rather than recompiling on every refresh.
 	comment := strings.Trim(e.opts.GetString("comment-begin"), "\"")
-	if comment != e.commentBegin {
-		e.commentBegin = comment
-		e.commentRegexp = nil
-
+	if comment != e.commentToken {
+		e.commentToken = comment
+		e.commentRegex = nil
 		if comment != "" {
-			commentPattern := fmt.Sprintf(`(^|\s)%s.*`, comment)
-			if commentsMatch, err := regexp.Compile(commentPattern); err == nil {
-				e.commentRegexp = commentsMatch
-			}
+			e.commentRegex, _ = regexp.Compile(fmt.Sprintf(`(^|\s)%s.*`, comment))
 		}
 	}
 
-	if e.commentRegexp != nil {
+	if e.commentRegex != nil {
 		commentColor := color.SGRStart + color.Fg + "244" + color.SGREnd
-		result = e.commentRegexp.ReplaceAllString(result, fmt.Sprintf("%s${0}%s", commentColor, color.Reset))
+		highlighted = e.commentRegex.ReplaceAllString(highlighted, fmt.Sprintf("%s${0}%s", commentColor, color.Reset))
 	}
 
-	result += color.Reset
+	highlighted += color.Reset
 
-	return result
+	return highlighted
 }
 
 func sortHighlights(vhl core.Selection) []core.Selection {
@@ -107,16 +111,12 @@ func sortHighlights(vhl core.Selection) []core.Selection {
 	return sorted
 }
 
-var colorSeqRegexp = regexp.MustCompile(`\x1b\[[0-9;]+m`)
-
-func (e *Engine) getHighlights(line []rune, sorted []core.Selection) map[int]string {
-	highlights := make(map[int]string)
+func (e *Engine) getHighlights(line []rune, sorted []core.Selection) map[int][]rune {
+	highlights := make(map[int][]rune)
 
 	// Find any highlighting already applied on the line,
 	// and keep the indexes so that we can skip those.
-	var colors [][]int
-
-	colors = colorSeqRegexp.FindAllStringIndex(string(line), -1)
+	colors := ansiEscapeRegex.FindAllStringIndex(string(line), -1)
 
 	// marks that started highlighting, but not done yet.
 	regions := make([]core.Selection, 0)
@@ -162,7 +162,7 @@ func (e *Engine) getHighlights(line []rune, sorted []core.Selection) map[int]str
 		// Add to the line, with the raw index since
 		// we must take into account embedded colors.
 		if len(posHl) > 0 {
-			highlights[rawIndex] = string(posHl)
+			highlights[rawIndex] = posHl
 		}
 	}
 
@@ -225,14 +225,6 @@ func (e *Engine) hlReset(regions []core.Selection, line []rune, pos int) ([]core
 			// foreground := e.opts.GetString("active-region-start-color")
 			line = append(line, []rune(color.ReverseReset)...)
 			line = append(line, []rune(color.BgDefault)...)
-			//	if background == "" && foreground == "" && !matcher {
-			//		line = append(line, []rune(color.ReverseReset)...)
-			//	} else {
-			//
-			//		line = append(line, []rune(color.BgDefault)...)
-			//	}
-			//
-			// line = append(line, []rune(color.ReverseReset)...)
 		}
 	}
 

@@ -69,7 +69,13 @@ func (k *Keys) readInputFiltered() (keys []byte, err error) {
 		// send by ourselves, because we pause reading.
 		buf := make([]byte, keyScanBufSize)
 
-		read, err := Stdin.Read(buf)
+		var read int
+		var err error
+		if reader, ok := Stdin.(*rawReader); ok {
+			read, err = reader.read(buf, k.waitConsoleInput)
+		} else {
+			read, err = Stdin.Read(buf)
+		}
 		if err != nil {
 			// EOF (stream closed) or any other read failure (e.g. a revoked
 			// console handle): propagate it so WaitAvailableKeys records EOF or
@@ -83,7 +89,10 @@ func (k *Keys) readInputFiltered() (keys []byte, err error) {
 		// On Windows, windows resize events are sent through stdin,
 		// so if one is detected, send it back to the display engine.
 		if len(input) == 1 && input[0] == WINDOWS_RESIZE {
-			k.resize <- true
+			select {
+			case k.resize <- true:
+			default:
+			}
 			continue
 		}
 
@@ -98,17 +107,6 @@ func (k *Keys) readInputFiltered() (keys []byte, err error) {
 		return keys, nil
 	}
 }
-
-// InitWake is a no-op on Windows: the async-refresh wake (poll-based on Unix)
-// is not yet supported here, so async UI updates appear at the next keystroke.
-func (k *Keys) InitWake() {}
-
-// CloseWake is a no-op on Windows.
-func (k *Keys) CloseWake() {}
-
-// RequestRefresh is a no-op on Windows (async wake unsupported); async UI
-// updates appear at the next keystroke.
-func (k *Keys) RequestRefresh() {}
 
 // rawReader translates Windows input to ANSI sequences,
 // to provide the same behavior as Unix terminals.
@@ -127,18 +125,36 @@ func newRawReader() *rawReader {
 // Read reads input record from stdin on Windows.
 // It keeps reading until it gets a key event.
 func (r *rawReader) Read(buf []byte) (int, error) {
-	ir := new(_INPUT_RECORD)
-	var read int
-	var err error
+	return r.read(buf, nil)
+}
 
-next:
-	// ReadConsoleInputW reads input record from stdin.
-	err = kernel.ReadConsoleInputW(stdin,
-		uintptr(unsafe.Pointer(ir)),
+func (r *rawReader) read(buf []byte, wait func() error) (int, error) {
+	return r.readRecords(buf, wait, readConsoleRecord)
+}
+
+func readConsoleRecord(record *_INPUT_RECORD) error {
+	var read int
+	return kernel.ReadConsoleInputW(stdin,
+		uintptr(unsafe.Pointer(record)),
 		1,
 		uintptr(unsafe.Pointer(&read)),
 	)
-	if err != nil {
+}
+
+func (r *rawReader) readRecords(buf []byte, wait func() error, readRecord func(*_INPUT_RECORD) error) (int, error) {
+	ir := new(_INPUT_RECORD)
+
+next:
+	// An ignored focus/key-release record must return through the wait too:
+	// otherwise a refresh arriving afterwards could leave ReadConsoleInputW
+	// blocked indefinitely while the caller waits for the next actual key.
+	if wait != nil {
+		if err := wait(); err != nil {
+			return 0, err
+		}
+	}
+
+	if err := readRecord(ir); err != nil {
 		return 0, err
 	}
 

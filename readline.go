@@ -50,6 +50,9 @@ var ErrInterrupt = errors.New(os.Interrupt.String())
 // and it is up to the caller to decide what to do with the line result.
 // When the error is not nil, the returned line is not written to history.
 func (rl *Shell) Readline() (string, error) {
+	rl.beginOutput()
+	defer rl.finishOutput()
+
 	descriptor := int(os.Stdin.Fd())
 
 	if term.IsTerminal(descriptor) {
@@ -102,6 +105,11 @@ func (rl *Shell) Readline() (string, error) {
 		// Since we always update helpers after being asked to read
 		// for user input again, we do it before actually reading it.
 		rl.Display.Refresh()
+
+		// Background output is rendered here, alongside all other editor
+		// mutations. Refresh first so the initial frame of a new Readline has
+		// replaced any coordinates left over from the previously accepted line.
+		rl.flushOutput()
 
 		// Block and wait for available user input keys.
 		// These might be read on stdin, or already available because

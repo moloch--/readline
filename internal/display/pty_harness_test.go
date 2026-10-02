@@ -165,6 +165,41 @@ func runPTYChild() {
 		rl.Prompt.Right(func() string { return rp })
 	}
 
+	if os.Getenv("READLINE_PTY_OUTPUT_CALLBACKS") == "1" {
+		var promptOnce sync.Once
+		rl.Prompt.Primary(func() string {
+			promptOnce.Do(func() { _, _ = rl.PrintTransientf("PROMPT-OUTPUT") })
+			return prompt
+		})
+		var once sync.Once
+		rl.SyntaxHighlighter = func(line []rune) string {
+			if len(line) > 0 {
+				once.Do(func() { _, _ = rl.PrintTransientf("HIGHLIGHTER-OUTPUT") })
+			}
+			return string(line)
+		}
+		rl.AcceptMultiline = func([]rune) bool {
+			_, _ = rl.Printf("ACCEPT-OUTPUT")
+			return true
+		}
+	}
+
+	if os.Getenv("READLINE_PTY_ASYNC_OUTPUT") == "1" {
+		go func() {
+			for i := range 12 {
+				time.Sleep(50 * time.Millisecond)
+				if i%2 == 0 {
+					_, _ = rl.PrintTransientf("LOG-%02d", i)
+				} else {
+					_, _ = rl.Printf("LOG-%02d", i)
+				}
+				rl.Hint.SetTransient(fmt.Sprintf("STATUS-%02d", i))
+				rl.RefreshCompletions()
+			}
+			_, _ = rl.PrintTransientf("LOG-DONE")
+		}()
+	}
+
 	line, err := rl.Readline()
 	if err != nil {
 		fmt.Fprintf(os.Stdout, "\r\n[ERR:%s]\r\n", err)
@@ -172,6 +207,20 @@ func runPTYChild() {
 	}
 
 	fmt.Fprintf(os.Stdout, "\r\n[LINE:%s]\r\n", line)
+	if os.Getenv("READLINE_PTY_REPEAT_OUTPUT") == "1" {
+		fmt.Fprint(os.Stdout, "\r\nFIRST-DONE\r\n")
+		var once sync.Once
+		rl.Prompt.Primary(func() string {
+			once.Do(func() { _, _ = rl.PrintTransientf("NEXT-OUTPUT") })
+			return "NEXT> "
+		})
+		line, err = rl.Readline()
+		if err != nil {
+			fmt.Fprintf(os.Stdout, "\r\n[ERR:%s]\r\n", err)
+			os.Exit(0)
+		}
+		fmt.Fprintf(os.Stdout, "\r\n[SECOND:%s]\r\n", line)
+	}
 	os.Exit(0)
 }
 
@@ -184,6 +233,7 @@ type console struct {
 	term vt10x.Terminal
 
 	mu         sync.Mutex // guards term (writer + reads), probeCount and DSR replies
+	raw        bytes.Buffer
 	done       chan struct{}
 	probeCount int // number of "ESC[6n" cursor-position queries observed
 
@@ -224,7 +274,10 @@ type consoleConfig struct {
 	rightPrompt string
 	// autocomplete turns on as-you-type autocompletion with a static completer
 	// (several values + a usage hint), to exercise the hint+menu redraw path.
-	autocomplete bool
+	autocomplete    bool
+	asyncOutput     bool
+	outputCallbacks bool
+	repeatOutput    bool
 	// probeReply, if non-nil, computes the DSR reply for an "ESC[6n" query,
 	// letting tests simulate a terminal that reports a wrong cursor position.
 	probeReply func(vt10x.Cursor) string
@@ -275,6 +328,15 @@ func startConsole(t *testing.T, cfg consoleConfig) *console {
 	if cfg.autocomplete {
 		cmd.Env = append(cmd.Env, autocompleteEnvVar+"=1")
 	}
+	if cfg.asyncOutput {
+		cmd.Env = append(cmd.Env, "READLINE_PTY_ASYNC_OUTPUT=1")
+	}
+	if cfg.outputCallbacks {
+		cmd.Env = append(cmd.Env, "READLINE_PTY_OUTPUT_CALLBACKS=1")
+	}
+	if cfg.repeatOutput {
+		cmd.Env = append(cmd.Env, "READLINE_PTY_REPEAT_OUTPUT=1")
+	}
 
 	if cfg.asyncRepeat > 0 {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("READLINE_PTY_ASYNC_REPEAT=%d", cfg.asyncRepeat))
@@ -317,6 +379,7 @@ func (c *console) readLoop() {
 			chunk := buf[:n]
 
 			c.mu.Lock()
+			_, _ = c.raw.Write(chunk)
 			_, _ = c.term.Write(chunk)
 			c.mu.Unlock()
 
@@ -386,6 +449,12 @@ func (c *console) screen() string {
 	return c.term.String()
 }
 
+func (c *console) rawOutput() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.raw.String()
+}
+
 // screenWaitTimeout bounds how long the screen-polling helpers wait before
 // failing the test. Every call site used the same value, so it lives here.
 //
@@ -453,4 +522,8 @@ func (c *console) close() {
 
 	_ = c.cmd.Wait()
 	<-c.done
+	if raw := c.rawOutput(); strings.Contains(raw, "WARNING: DATA RACE") {
+		start := strings.Index(raw, "WARNING: DATA RACE")
+		c.t.Errorf("race detector reported a data race in the PTY child:\n%s", raw[start:min(start+4000, len(raw))])
+	}
 }

@@ -2,6 +2,9 @@ package readline
 
 import (
 	"fmt"
+	"io"
+	"os"
+	"sync"
 
 	"github.com/reeflective/readline/inputrc"
 	"github.com/reeflective/readline/internal/completion"
@@ -24,6 +27,12 @@ import (
 // Please refer to the README and documentation for more details about the shell
 // and its components, and how to use them.
 type Shell struct {
+	// Output requests share the Readline goroutine with editing and rendering.
+	// This mutex protects only the queue and session lifetime, never callbacks.
+	outputMu sync.Mutex
+	reading  bool
+	output   []shellOutput
+
 	// Core editor
 	line       *core.Line       // The input line buffer and its management methods.
 	cursor     *core.Cursor     // The cursor and its methods.
@@ -144,41 +153,81 @@ func (rl *Shell) Selection() *core.Selection { return rl.selection }
 // Printf prints a formatted string below the current line and redisplays the prompt
 // and input line (and possibly completions/hints if active) below the logged string.
 // A newline is added to the message so that the prompt is correctly refreshed below.
+// During Readline, output is queued for its render loop and the returned count is
+// the number of bytes queued; eventual terminal write errors cannot be returned.
+// This is safe to call from background goroutines and from editor callbacks.
 func (rl *Shell) Printf(msg string, args ...any) (n int, err error) {
-	// First go back to the last line of the input line,
-	// and clear everything below (hints and completions).
-	rl.Display.CursorBelowLine()
-	term.MoveCursorBackwards(term.GetWidth())
-	term.WriteString(term.ClearScreenBelow)
-
-	// Skip a line, and print the formatted message.
-	n, err = fmt.Printf(msg+"\n", args...)
-
-	// Redisplay the prompt, input line and active helpers.
-	rl.Display.PrintPrimaryPrompt()
-	rl.Display.Refresh()
-
-	return
+	return rl.writeOutput(shellOutput{text: fmt.Sprintf(msg+"\n", args...)})
 }
 
 // PrintTransientf prints a formatted string in place of the current prompt and input
 // line, and then refreshes, or "pushes" the prompt/line below this printed message.
+// During Readline it has the same queueing and return semantics as Printf.
 func (rl *Shell) PrintTransientf(msg string, args ...any) (n int, err error) {
-	// First go back to the beginning of the line/prompt, and
-	// clear everything below (prompt/line/hints/completions).
-	rl.Display.CursorToLineStart()
-	term.MoveCursorBackwards(term.GetWidth())
-	term.MoveCursorUp(rl.Prompt.PrimaryUsed())
-	term.WriteString(term.ClearScreenBelow)
+	return rl.writeOutput(shellOutput{text: fmt.Sprintf(msg+"\n", args...), transient: true})
+}
 
-	// Print the logged message.
-	n, err = fmt.Printf(msg+"\n", args...)
+type shellOutput struct {
+	text      string
+	transient bool
+}
 
-	// Redisplay the prompt, input line and active helpers.
-	rl.Display.PrintPrimaryPrompt()
-	rl.Display.Refresh()
+func (rl *Shell) writeOutput(output shellOutput) (int, error) {
+	rl.outputMu.Lock()
+	if !rl.reading {
+		// No active editor owns the terminal. Serialize ordinary writes with
+		// the next Readline start, without touching stale prompt coordinates.
+		defer rl.outputMu.Unlock()
+		return io.WriteString(os.Stdout, output.text)
+	}
 
-	return
+	rl.output = append(rl.output, output)
+	rl.outputMu.Unlock()
+	rl.Keys.RequestRefresh()
+	return len(output.text), nil
+}
+
+func (rl *Shell) beginOutput() {
+	rl.outputMu.Lock()
+	rl.reading = true
+	rl.outputMu.Unlock()
+}
+
+func (rl *Shell) finishOutput() {
+	rl.outputMu.Lock()
+	defer rl.outputMu.Unlock()
+
+	// Readline has finished and restored the terminal. Requests made during
+	// its final callbacks still need printing, but no prompt should reappear.
+	for _, output := range rl.output {
+		_, _ = io.WriteString(os.Stdout, output.text)
+	}
+	rl.output = nil
+	rl.reading = false
+}
+
+func (rl *Shell) flushOutput() {
+	rl.outputMu.Lock()
+	outputs := rl.output
+	rl.output = nil
+	rl.outputMu.Unlock()
+
+	// Detach the batch before rendering: prompt/highlighter/completion
+	// callbacks may themselves print, and must never wait for this goroutine.
+	for _, output := range outputs {
+		if output.transient {
+			rl.Display.CursorToLineStart()
+			term.MoveCursorBackwards(term.GetWidth())
+			term.MoveCursorUp(rl.Prompt.PrimaryUsed())
+		} else {
+			rl.Display.CursorBelowLine()
+			term.MoveCursorBackwards(term.GetWidth())
+		}
+		term.WriteString(term.ClearScreenBelow)
+		_, _ = io.WriteString(os.Stdout, output.text)
+		rl.Display.PrintPrimaryPrompt()
+		rl.Display.Refresh()
+	}
 }
 
 // SetInlineSuggestion sets a suggestion to display after the cursor.
